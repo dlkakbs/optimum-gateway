@@ -28,10 +28,7 @@ func TestPeerTopicTracerTracksRPCSubscriptions(t *testing.T) {
 	topic := "/eth2/c6ecb76c/beacon_attestation_17/ssz_snappy"
 	peerID := peer.ID("peer-1")
 
-	var emptied []string
-	tr := tracer.NewPeerTopicTracer(logger.NewAppSLogger(logger.Debug), &mockForkManager{}, func(topic string) {
-		emptied = append(emptied, topic)
-	})
+	tr := tracer.NewPeerTopicTracer(logger.NewAppSLogger(logger.Debug), &mockForkManager{})
 
 	tr.Trace(subscriptionEvent(peerID, topic, true))
 	tr.Trace(subscriptionEvent(peerID, topic, true))
@@ -41,13 +38,11 @@ func TestPeerTopicTracerTracksRPCSubscriptions(t *testing.T) {
 	tr.Trace(subscriptionEvent(peerID, topic, false))
 
 	require.Empty(t, tr.GetDiscoveredTopics())
-	require.Equal(t, []string{topic}, emptied)
 	require.Equal(t, []string{topic}, tr.GetAndEraseUnsubscribeTopics())
 	require.Empty(t, tr.GetAndEraseUnsubscribeTopics())
 
 	tr.Trace(subscriptionEvent(peerID, "/eth2/c6ecb76c/beacon_attestation_18/ssz_snappy", false))
 	require.Empty(t, tr.GetDiscoveredTopics())
-	require.Equal(t, []string{topic}, emptied)
 	require.Empty(t, tr.GetAndEraseUnsubscribeTopics())
 }
 
@@ -55,7 +50,7 @@ func TestPeerTopicTracerIgnoresLocalAndMeshLifecycleEvents(t *testing.T) {
 	topic := "/eth2/c6ecb76c/beacon_attestation_17/ssz_snappy"
 	meshTopic := "/eth2/c6ecb76c/beacon_attestation_18/ssz_snappy"
 	peerID := peer.ID("peer-1")
-	tr := tracer.NewPeerTopicTracer(logger.NewAppSLogger(logger.Debug), &mockForkManager{}, nil)
+	tr := tracer.NewPeerTopicTracer(logger.NewAppSLogger(logger.Debug), &mockForkManager{})
 
 	tr.Trace(&pubsubpb.TraceEvent{
 		Type:   pubsubpb.TraceEvent_JOIN.Enum(),
@@ -94,10 +89,7 @@ func TestPeerTopicTracerTracksForkDigestFromSubscriptions(t *testing.T) {
 			supportedDigests: map[string]bool{"c6ecb76c": true},
 		}
 
-		var emptied []string
-		tr := tracer.NewPeerTopicTracer(l, forks, func(topic string) {
-			emptied = append(emptied, topic)
-		})
+		tr := tracer.NewPeerTopicTracer(l, forks)
 
 		tr.Trace(subscriptionEvent(peerID, topic, true))
 
@@ -107,7 +99,7 @@ func TestPeerTopicTracerTracksForkDigestFromSubscriptions(t *testing.T) {
 		tr.Trace(subscriptionEvent(peerID, topic, false))
 
 		require.Empty(t, tr.GetDiscoveredTopics())
-		require.Equal(t, []string{topic}, emptied)
+		require.Equal(t, []string{topic}, tr.GetAndEraseUnsubscribeTopics())
 	})
 
 	t.Run("unsupported fork digest is not observed", func(t *testing.T) {
@@ -117,7 +109,7 @@ func TestPeerTopicTracerTracksForkDigestFromSubscriptions(t *testing.T) {
 			supportedDigests: map[string]bool{"c6ecb76c": true},
 		}
 
-		tr := tracer.NewPeerTopicTracer(l, forks, nil)
+		tr := tracer.NewPeerTopicTracer(l, forks)
 		tr.Trace(subscriptionEvent(peerID, topic, true))
 
 		require.Empty(t, forks.observedDigests)
@@ -131,7 +123,7 @@ func TestPeerTopicTracerTracksForkDigestFromSubscriptions(t *testing.T) {
 		mockFrkMgr := &mockForkManager{
 			supportedDigests: map[string]bool{"c6ecb76c": true},
 		}
-		tr := tracer.NewPeerTopicTracer(l, mockFrkMgr, nil)
+		tr := tracer.NewPeerTopicTracer(l, mockFrkMgr)
 
 		tr.Trace(&pubsubpb.TraceEvent{
 			Type: pubsubpb.TraceEvent_RECV_RPC.Enum(),
@@ -188,11 +180,8 @@ func TestPeerTopicTracerRemovePeerIfDisconnected(t *testing.T) {
 	peerA := peer.ID("peer-a")
 	peerB := peer.ID("peer-b")
 
-	var emptied []string
 	tr := tracer.NewPeerTopicTracer(logger.NewAppSLogger(logger.Debug), &mockForkManager{
 		supportedDigests: map[string]bool{"c6ecb76c": true},
-	}, func(topic string) {
-		emptied = append(emptied, topic)
 	})
 
 	tr.Trace(subscriptionEvent(peerA, topicA, true))
@@ -201,7 +190,6 @@ func TestPeerTopicTracerRemovePeerIfDisconnected(t *testing.T) {
 
 	tr.RemovePeerIfDisconnected(peerA, func() bool { return true })
 	require.Equal(t, []string{topicA}, tr.GetDiscoveredTopics())
-	require.Equal(t, []string{topicB}, emptied)
 	require.Equal(t, []string{topicB}, tr.GetAndEraseUnsubscribeTopics())
 
 	tr.RemovePeerIfDisconnected(peerB, func() bool { return false })
@@ -210,7 +198,6 @@ func TestPeerTopicTracerRemovePeerIfDisconnected(t *testing.T) {
 
 	tr.RemovePeerIfDisconnected(peerB, func() bool { return true })
 	require.Empty(t, tr.GetDiscoveredTopics())
-	require.Equal(t, []string{topicB, topicA}, emptied)
 	require.Equal(t, []string{topicA}, tr.GetAndEraseUnsubscribeTopics())
 
 	tr.RemovePeerIfDisconnected(peerB, func() bool { return true })
@@ -218,6 +205,33 @@ func TestPeerTopicTracerRemovePeerIfDisconnected(t *testing.T) {
 
 	tr.RemovePeerIfDisconnected(peerB, nil)
 	require.Empty(t, tr.GetAndEraseUnsubscribeTopics())
+}
+
+func TestPeerTopicTracerRechecksQueuedUnsubscribes(t *testing.T) {
+	topic := "/eth2/c6ecb76c/beacon_attestation_17/ssz_snappy"
+	peerID := peer.ID("peer-1")
+
+	t.Run("resubscribed topic is skipped", func(t *testing.T) {
+		tr := tracer.NewPeerTopicTracer(logger.NewAppSLogger(logger.Debug), &mockForkManager{})
+
+		tr.Trace(subscriptionEvent(peerID, topic, true))
+		tr.Trace(subscriptionEvent(peerID, topic, false))
+		tr.Trace(subscriptionEvent(peerID, topic, true))
+
+		require.Equal(t, []string{topic}, tr.GetDiscoveredTopics())
+		require.Empty(t, tr.GetAndEraseUnsubscribeTopics())
+	})
+
+	t.Run("repeated empty transitions are deduplicated", func(t *testing.T) {
+		tr := tracer.NewPeerTopicTracer(logger.NewAppSLogger(logger.Debug), &mockForkManager{})
+
+		tr.Trace(subscriptionEvent(peerID, topic, true))
+		tr.Trace(subscriptionEvent(peerID, topic, false))
+		tr.Trace(subscriptionEvent(peerID, topic, true))
+		tr.Trace(subscriptionEvent(peerID, topic, false))
+
+		require.Equal(t, []string{topic}, tr.GetAndEraseUnsubscribeTopics())
+	})
 }
 
 func subscriptionEvent(peerID peer.ID, topic string, subscribe bool) *pubsubpb.TraceEvent {

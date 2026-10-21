@@ -20,17 +20,16 @@ type PeerTopicTracer struct {
 	discoveredTopics  map[string]map[peer.ID]struct{} // topic -> set of peer IDs
 	unsubscribeTopics *syncx.RWSlice[string]
 	mu                sync.RWMutex
-	onTopicEmpty      func(topic string) // callback to unsubscribe gateway when topic has 0 peers
 	forkManager       ForkManager
 }
 
-func NewPeerTopicTracer(log logger.AppLogger, s ForkManager, onTopicEmpty func(topic string)) *PeerTopicTracer {
+// NewPeerTopicTracer creates a tracer that records remote subscription state.
+func NewPeerTopicTracer(log logger.AppLogger, s ForkManager) *PeerTopicTracer {
 	return &PeerTopicTracer{
 		forkManager:       s,
 		log:               log,
 		discoveredTopics:  make(map[string]map[peer.ID]struct{}),
 		unsubscribeTopics: syncx.NewRWSlice[string](),
-		onTopicEmpty:      onTopicEmpty,
 	}
 }
 
@@ -140,10 +139,6 @@ func (t *PeerTopicTracer) removePeerTopicLocked(peerID peer.ID, topic string) {
 		delete(peers, peerID)
 		if len(peers) == 0 {
 			delete(t.discoveredTopics, topic)
-			// If topic has 0 peers, unsubscribe gateway from this topic
-			if t.onTopicEmpty != nil {
-				t.onTopicEmpty(topic)
-			}
 			t.unsubscribeTopics.Add(topic)
 		}
 	}
@@ -176,6 +171,26 @@ func (t *PeerTopicTracer) GetDiscoveredTopics() []string {
 	return commonmaps.MapKeys(t.discoveredTopics)
 }
 
+// GetAndEraseUnsubscribeTopics returns queued topics that are still empty.
 func (t *PeerTopicTracer) GetAndEraseUnsubscribeTopics() []string {
-	return t.unsubscribeTopics.LoadAndErase()
+	candidates := t.unsubscribeTopics.LoadAndErase()
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	emptyTopics := make([]string, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
+	for _, topic := range candidates {
+		if _, ok := seen[topic]; ok {
+			continue
+		}
+		seen[topic] = struct{}{}
+		if len(t.discoveredTopics[topic]) == 0 {
+			emptyTopics = append(emptyTopics, topic)
+		}
+	}
+	return emptyTopics
 }
