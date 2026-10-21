@@ -245,6 +245,11 @@ func (s *Service) onPeerDisconnected(n network.Network, conn network.Conn) {
 		s.libP2PDirectPeers.Delete(peerID.String())
 		s.hostLibP2P.Peerstore().ClearAddrs(peerID)
 		s.hostLibP2P.Peerstore().RemovePeer(peerID)
+		if s.peerTopicTracer != nil {
+			s.peerTopicTracer.RemovePeerIfDisconnected(peerID, func() bool {
+				return n.Connectedness(peerID) != network.Connected
+			})
+		}
 	}
 	telemetry.CLPeerDisconnected()
 }
