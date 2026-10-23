@@ -21,15 +21,17 @@ type PeerTopicTracer struct {
 	unsubscribeTopics *syncx.RWSlice[string]
 	mu                sync.RWMutex
 	forkManager       ForkManager
+	topicDiscovered   chan<- struct{}
 }
 
 // NewPeerTopicTracer creates a tracer that records remote subscription state.
-func NewPeerTopicTracer(log logger.AppLogger, s ForkManager) *PeerTopicTracer {
+func NewPeerTopicTracer(log logger.AppLogger, s ForkManager, topicDiscovered chan<- struct{}) *PeerTopicTracer {
 	return &PeerTopicTracer{
 		forkManager:       s,
 		log:               log,
 		discoveredTopics:  make(map[string]map[peer.ID]struct{}),
 		unsubscribeTopics: syncx.NewRWSlice[string](),
+		topicDiscovered:   topicDiscovered,
 	}
 }
 
@@ -70,6 +72,7 @@ func (t *PeerTopicTracer) Trace(evt *pubsubpb.TraceEvent) {
 			if m == nil || m.Topic == nil {
 				continue
 			}
+			t.observeForkDigest(*m.Topic)
 			telemetry.LibP2PGossipsubRPCMessagesInc(*m.Topic, peerID.String(), "recv")
 		}
 
@@ -103,6 +106,7 @@ func (t *PeerTopicTracer) addPeerTopic(peerID peer.ID, topic string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	topicIsNew := t.discoveredTopics[topic] == nil
 	if t.discoveredTopics[topic] == nil {
 		t.discoveredTopics[topic] = make(map[peer.ID]struct{})
 	}
@@ -121,10 +125,29 @@ func (t *PeerTopicTracer) addPeerTopic(peerID peer.ID, topic string) {
 		)
 		if t.forkManager.CheckForkSupported(forkDigest) {
 			l.Debug("remote peer subscribed to new topic with supported fork digest")
-			t.forkManager.SetObservedDigest(forkDigest)
+			if topicIsNew {
+				t.notifyTopicDiscovered()
+			}
 		} else {
 			l.Error("remote peer subscribed to non-supported fork digest", fmt.Errorf("non-supported fork digest"))
 		}
+	}
+}
+
+func (t *PeerTopicTracer) notifyTopicDiscovered() {
+	select {
+	case t.topicDiscovered <- struct{}{}:
+	default:
+	}
+}
+
+func (t *PeerTopicTracer) observeForkDigest(topic string) {
+	forkDigest := topics.GetForkDigestFromTopic(topic)
+	if forkDigest == "" || forkDigest == t.forkManager.ActiveDigest() {
+		return
+	}
+	if t.forkManager.CheckForkSupported(forkDigest) {
+		t.forkManager.SetObservedDigest(forkDigest)
 	}
 }
 

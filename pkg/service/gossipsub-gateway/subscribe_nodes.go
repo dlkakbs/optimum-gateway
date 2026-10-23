@@ -64,6 +64,9 @@ func (s *Service) subscribeToTopic(topic string) error {
 		s.log.Info("skipping subscription to topic, not a beacon block or attestation topic", logger.WithTopic(topic))
 		return nil
 	}
+	s.topicMu.Lock()
+	defer s.topicMu.Unlock()
+
 	// Check if already subscribed
 	if _, ok := s.libP2PSubs.Load(topic); ok {
 		return nil
@@ -140,6 +143,9 @@ func (s *Service) handleSubscription(ctx context.Context, topicName string, sub 
 }
 
 func (s *Service) unsubscribeFromTopic(topic string) {
+	s.topicMu.Lock()
+	defer s.topicMu.Unlock()
+
 	// Unsubscribe from CL (libp2p) topic
 	if sub, ok := s.libP2PSubs.Load(topic); ok {
 		sub.Cancel()

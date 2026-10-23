@@ -14,6 +14,11 @@ import (
 type mockForkManager struct {
 	supportedDigests map[string]bool
 	observedDigests  []string
+	activeDigest     string
+}
+
+func (m *mockForkManager) ActiveDigest() string {
+	return m.activeDigest
 }
 
 func (m *mockForkManager) CheckForkSupported(forkDigest string) bool {
@@ -22,13 +27,14 @@ func (m *mockForkManager) CheckForkSupported(forkDigest string) bool {
 
 func (m *mockForkManager) SetObservedDigest(forkDigest string) {
 	m.observedDigests = append(m.observedDigests, forkDigest)
+	m.activeDigest = forkDigest
 }
 
 func TestPeerTopicTracerTracksRPCSubscriptions(t *testing.T) {
 	topic := "/eth2/c6ecb76c/beacon_attestation_17/ssz_snappy"
 	peerID := peer.ID("peer-1")
 
-	tr := tracer.NewPeerTopicTracer(logger.NewAppSLogger(logger.Debug), &mockForkManager{})
+	tr := tracer.NewPeerTopicTracer(logger.NewAppSLogger(logger.Debug), &mockForkManager{}, nil)
 
 	tr.Trace(subscriptionEvent(peerID, topic, true))
 	tr.Trace(subscriptionEvent(peerID, topic, true))
@@ -50,7 +56,7 @@ func TestPeerTopicTracerIgnoresLocalAndMeshLifecycleEvents(t *testing.T) {
 	topic := "/eth2/c6ecb76c/beacon_attestation_17/ssz_snappy"
 	meshTopic := "/eth2/c6ecb76c/beacon_attestation_18/ssz_snappy"
 	peerID := peer.ID("peer-1")
-	tr := tracer.NewPeerTopicTracer(logger.NewAppSLogger(logger.Debug), &mockForkManager{})
+	tr := tracer.NewPeerTopicTracer(logger.NewAppSLogger(logger.Debug), &mockForkManager{}, nil)
 
 	tr.Trace(&pubsubpb.TraceEvent{
 		Type:   pubsubpb.TraceEvent_JOIN.Enum(),
@@ -80,40 +86,66 @@ func TestPeerTopicTracerIgnoresLocalAndMeshLifecycleEvents(t *testing.T) {
 	require.Equal(t, []string{topic}, tr.GetAndEraseUnsubscribeTopics())
 }
 
-func TestPeerTopicTracerTracksForkDigestFromSubscriptions(t *testing.T) {
+func TestPeerTopicTracerTracksForkDigestFromMessages(t *testing.T) {
 	l := logger.NewAppSLogger(logger.Debug)
-	t.Run("supported fork digest is observed", func(t *testing.T) {
-		topic := "/eth2/c6ecb76c/beacon_block/ssz_snappy"
+	t.Run("subscription does not activate a supported future fork", func(t *testing.T) {
+		currentTopic := "/eth2/c6ecb76c/beacon_block/ssz_snappy"
+		futureTopic := "/eth2/ddeeff00/beacon_block/ssz_snappy"
 		peerID := peer.ID("peer-2")
 		forks := &mockForkManager{
-			supportedDigests: map[string]bool{"c6ecb76c": true},
+			supportedDigests: map[string]bool{"c6ecb76c": true, "ddeeff00": true},
+			activeDigest:     "c6ecb76c",
 		}
 
-		tr := tracer.NewPeerTopicTracer(l, forks)
+		topicDiscovered := make(chan struct{}, 1)
+		tr := tracer.NewPeerTopicTracer(l, forks, topicDiscovered)
 
-		tr.Trace(subscriptionEvent(peerID, topic, true))
+		tr.Trace(subscriptionEvent(peerID, futureTopic, true))
 
-		require.Equal(t, []string{"c6ecb76c"}, forks.observedDigests)
-		require.Equal(t, []string{topic}, tr.GetDiscoveredTopics())
+		require.Equal(t, "c6ecb76c", forks.ActiveDigest())
+		require.Empty(t, forks.observedDigests)
+		require.Equal(t, []string{futureTopic}, tr.GetDiscoveredTopics())
+		require.Len(t, topicDiscovered, 1)
+		<-topicDiscovered
 
-		tr.Trace(subscriptionEvent(peerID, topic, false))
+		secondPeerID := peer.ID("peer-3")
+		tr.Trace(subscriptionEvent(secondPeerID, futureTopic, true))
+		require.Empty(t, topicDiscovered)
+
+		tr.Trace(messageEvent(peerID, currentTopic))
+		require.Equal(t, "c6ecb76c", forks.ActiveDigest())
+		require.Empty(t, forks.observedDigests)
+
+		tr.Trace(messageEvent(peerID, futureTopic))
+		require.Equal(t, "ddeeff00", forks.ActiveDigest())
+		require.Equal(t, []string{"ddeeff00"}, forks.observedDigests)
+
+		tr.Trace(subscriptionEvent(peerID, futureTopic, false))
+		require.Equal(t, []string{futureTopic}, tr.GetDiscoveredTopics())
+
+		tr.Trace(subscriptionEvent(secondPeerID, futureTopic, false))
 
 		require.Empty(t, tr.GetDiscoveredTopics())
-		require.Equal(t, []string{topic}, tr.GetAndEraseUnsubscribeTopics())
+		require.Equal(t, []string{futureTopic}, tr.GetAndEraseUnsubscribeTopics())
 	})
 
-	t.Run("unsupported fork digest is not observed", func(t *testing.T) {
+	t.Run("unsupported fork digest is neither observed nor signaled", func(t *testing.T) {
 		topic := "/eth2/deadbeef/beacon_block/ssz_snappy"
 		peerID := peer.ID("peer-3")
 		forks := &mockForkManager{
 			supportedDigests: map[string]bool{"c6ecb76c": true},
+			activeDigest:     "c6ecb76c",
 		}
 
-		tr := tracer.NewPeerTopicTracer(l, forks)
+		topicDiscovered := make(chan struct{}, 1)
+		tr := tracer.NewPeerTopicTracer(l, forks, topicDiscovered)
 		tr.Trace(subscriptionEvent(peerID, topic, true))
+		tr.Trace(messageEvent(peerID, topic))
 
 		require.Empty(t, forks.observedDigests)
+		require.Equal(t, "c6ecb76c", forks.ActiveDigest())
 		require.Equal(t, []string{topic}, tr.GetDiscoveredTopics())
+		require.Empty(t, topicDiscovered)
 	})
 	t.Run("trace rpc event", func(t *testing.T) {
 		subscriptionTopic := "/eth2/c6ecb76c/beacon_attestation_9/ssz_snappy"
@@ -123,7 +155,7 @@ func TestPeerTopicTracerTracksForkDigestFromSubscriptions(t *testing.T) {
 		mockFrkMgr := &mockForkManager{
 			supportedDigests: map[string]bool{"c6ecb76c": true},
 		}
-		tr := tracer.NewPeerTopicTracer(l, mockFrkMgr)
+		tr := tracer.NewPeerTopicTracer(l, mockFrkMgr, nil)
 
 		tr.Trace(&pubsubpb.TraceEvent{
 			Type: pubsubpb.TraceEvent_RECV_RPC.Enum(),
@@ -182,7 +214,7 @@ func TestPeerTopicTracerRemovePeerIfDisconnected(t *testing.T) {
 
 	tr := tracer.NewPeerTopicTracer(logger.NewAppSLogger(logger.Debug), &mockForkManager{
 		supportedDigests: map[string]bool{"c6ecb76c": true},
-	})
+	}, nil)
 
 	tr.Trace(subscriptionEvent(peerA, topicA, true))
 	tr.Trace(subscriptionEvent(peerB, topicA, true))
@@ -212,7 +244,7 @@ func TestPeerTopicTracerRechecksQueuedUnsubscribes(t *testing.T) {
 	peerID := peer.ID("peer-1")
 
 	t.Run("resubscribed topic is skipped", func(t *testing.T) {
-		tr := tracer.NewPeerTopicTracer(logger.NewAppSLogger(logger.Debug), &mockForkManager{})
+		tr := tracer.NewPeerTopicTracer(logger.NewAppSLogger(logger.Debug), &mockForkManager{}, nil)
 
 		tr.Trace(subscriptionEvent(peerID, topic, true))
 		tr.Trace(subscriptionEvent(peerID, topic, false))
@@ -223,7 +255,7 @@ func TestPeerTopicTracerRechecksQueuedUnsubscribes(t *testing.T) {
 	})
 
 	t.Run("repeated empty transitions are deduplicated", func(t *testing.T) {
-		tr := tracer.NewPeerTopicTracer(logger.NewAppSLogger(logger.Debug), &mockForkManager{})
+		tr := tracer.NewPeerTopicTracer(logger.NewAppSLogger(logger.Debug), &mockForkManager{}, nil)
 
 		tr.Trace(subscriptionEvent(peerID, topic, true))
 		tr.Trace(subscriptionEvent(peerID, topic, false))
@@ -244,6 +276,18 @@ func subscriptionEvent(peerID peer.ID, topic string, subscribe bool) *pubsubpb.T
 					Subscribe: new(subscribe),
 					Topic:     new(topic),
 				}},
+			},
+		},
+	}
+}
+
+func messageEvent(peerID peer.ID, topic string) *pubsubpb.TraceEvent {
+	return &pubsubpb.TraceEvent{
+		Type: pubsubpb.TraceEvent_RECV_RPC.Enum(),
+		RecvRPC: &pubsubpb.TraceEvent_RecvRPC{
+			ReceivedFrom: []byte(peerID),
+			Meta: &pubsubpb.TraceEvent_RPCMeta{
+				Messages: []*pubsubpb.TraceEvent_MessageMeta{{Topic: new(topic)}},
 			},
 		},
 	}

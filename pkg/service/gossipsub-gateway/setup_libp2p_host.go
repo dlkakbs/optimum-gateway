@@ -131,9 +131,9 @@ func (s *Service) setupLibP2PHost() error {
 
 	go s.handleHandshake()
 
-	// Initialize peer topic tracer to discover topics from connected peers
-	// and queue empty topics for background cleanup in refreshTopics.
-	s.peerTopicTracer = tracer.NewPeerTopicTracer(s.log, s.GetForkDigestManager())
+	// Initialize peer topic tracer to discover topics from connected peers and
+	// notify the background reconciler without running pubsub lifecycle calls inline.
+	s.peerTopicTracer = tracer.NewPeerTopicTracer(s.log, s.GetForkDigestManager(), s.topicDiscovered)
 
 	options := []libp2ppubsub.Option{
 		libp2ppubsub.WithMessageSignaturePolicy(libp2ppubsub.StrictNoSign),
