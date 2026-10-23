@@ -106,7 +106,7 @@ func (s *Service) subscribeLocalNode() {
 }
 
 func (s *Service) handleSubscription(ctx context.Context, topicName string, sub *libp2ppubsub.Subscription) {
-	defer s.unsubscribeFromTopic(topicName)
+	defer s.unsubscribeHandlerTopic(topicName, sub)
 	for {
 		select {
 		case <-ctx.Done():
@@ -142,10 +142,26 @@ func (s *Service) handleSubscription(ctx context.Context, topicName string, sub 
 	}
 }
 
+// unsubscribeFromTopic unconditionally removes the current subscription for topic.
 func (s *Service) unsubscribeFromTopic(topic string) {
 	s.topicMu.Lock()
 	defer s.topicMu.Unlock()
+	s.unsubscribeTopicLocked(topic)
+}
 
+// unsubscribeHandlerTopic removes topic only if sub is still its active handler.
+func (s *Service) unsubscribeHandlerTopic(topic string, sub *libp2ppubsub.Subscription) {
+	s.topicMu.Lock()
+	defer s.topicMu.Unlock()
+
+	if current, ok := s.libP2PSubs.Load(topic); ok && current != sub {
+		return
+	}
+	s.unsubscribeTopicLocked(topic)
+}
+
+// unsubscribeTopicLocked removes topic while topicMu is held.
+func (s *Service) unsubscribeTopicLocked(topic string) {
 	// Unsubscribe from CL (libp2p) topic
 	if sub, ok := s.libP2PSubs.Load(topic); ok {
 		sub.Cancel()
