@@ -127,6 +127,15 @@ func (s *Service) handleSubscription(ctx context.Context, topicName string, sub 
 			if msg.ReceivedFrom == s.hostLibP2P.ID() {
 				continue
 			}
+			if forkDigest := topics.GetForkDigestFromTopic(topicName); forkDigest != "" {
+				if s.srvForkMgr.ObserveMessageDigest(forkDigest) {
+					s.log.Info("active fork digest updated from CL traffic",
+						logger.WithString("fork_digest", forkDigest),
+						logger.WithTopic(topicName),
+						logger.WithPeerID(msg.ReceivedFrom),
+					)
+				}
+			}
 
 			select {
 			case s.clMessages <- &entities.CLMessage{

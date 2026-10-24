@@ -13,21 +13,10 @@ import (
 
 type mockForkManager struct {
 	supportedDigests map[string]bool
-	observedDigests  []string
-	activeDigest     string
-}
-
-func (m *mockForkManager) ActiveDigest() string {
-	return m.activeDigest
 }
 
 func (m *mockForkManager) CheckForkSupported(forkDigest string) bool {
 	return m.supportedDigests[forkDigest]
-}
-
-func (m *mockForkManager) SetObservedDigest(forkDigest string) {
-	m.observedDigests = append(m.observedDigests, forkDigest)
-	m.activeDigest = forkDigest
 }
 
 func TestPeerTopicTracerTracksRPCSubscriptions(t *testing.T) {
@@ -86,15 +75,13 @@ func TestPeerTopicTracerIgnoresLocalAndMeshLifecycleEvents(t *testing.T) {
 	require.Equal(t, []string{topic}, tr.GetAndEraseUnsubscribeTopics())
 }
 
-func TestPeerTopicTracerTracksForkDigestFromMessages(t *testing.T) {
+func TestPeerTopicTracerSignalsSupportedTopicDiscovery(t *testing.T) {
 	l := logger.NewAppSLogger(logger.Debug)
-	t.Run("subscription does not activate a supported future fork", func(t *testing.T) {
-		currentTopic := "/eth2/c6ecb76c/beacon_block/ssz_snappy"
+	t.Run("supported topic signals only on first discovery", func(t *testing.T) {
 		futureTopic := "/eth2/ddeeff00/beacon_block/ssz_snappy"
 		peerID := peer.ID("peer-2")
 		forks := &mockForkManager{
 			supportedDigests: map[string]bool{"c6ecb76c": true, "ddeeff00": true},
-			activeDigest:     "c6ecb76c",
 		}
 
 		topicDiscovered := make(chan struct{}, 1)
@@ -102,8 +89,6 @@ func TestPeerTopicTracerTracksForkDigestFromMessages(t *testing.T) {
 
 		tr.Trace(subscriptionEvent(peerID, futureTopic, true))
 
-		require.Equal(t, "c6ecb76c", forks.ActiveDigest())
-		require.Empty(t, forks.observedDigests)
 		require.Equal(t, []string{futureTopic}, tr.GetDiscoveredTopics())
 		require.Len(t, topicDiscovered, 1)
 		<-topicDiscovered
@@ -111,14 +96,6 @@ func TestPeerTopicTracerTracksForkDigestFromMessages(t *testing.T) {
 		secondPeerID := peer.ID("peer-3")
 		tr.Trace(subscriptionEvent(secondPeerID, futureTopic, true))
 		require.Empty(t, topicDiscovered)
-
-		tr.Trace(messageEvent(peerID, currentTopic))
-		require.Equal(t, "c6ecb76c", forks.ActiveDigest())
-		require.Empty(t, forks.observedDigests)
-
-		tr.Trace(messageEvent(peerID, futureTopic))
-		require.Equal(t, "ddeeff00", forks.ActiveDigest())
-		require.Equal(t, []string{"ddeeff00"}, forks.observedDigests)
 
 		tr.Trace(subscriptionEvent(peerID, futureTopic, false))
 		require.Equal(t, []string{futureTopic}, tr.GetDiscoveredTopics())
@@ -129,21 +106,17 @@ func TestPeerTopicTracerTracksForkDigestFromMessages(t *testing.T) {
 		require.Equal(t, []string{futureTopic}, tr.GetAndEraseUnsubscribeTopics())
 	})
 
-	t.Run("unsupported fork digest is neither observed nor signaled", func(t *testing.T) {
+	t.Run("unsupported fork digest is not signaled", func(t *testing.T) {
 		topic := "/eth2/deadbeef/beacon_block/ssz_snappy"
 		peerID := peer.ID("peer-3")
 		forks := &mockForkManager{
 			supportedDigests: map[string]bool{"c6ecb76c": true},
-			activeDigest:     "c6ecb76c",
 		}
 
 		topicDiscovered := make(chan struct{}, 1)
 		tr := tracer.NewPeerTopicTracer(l, forks, topicDiscovered)
 		tr.Trace(subscriptionEvent(peerID, topic, true))
-		tr.Trace(messageEvent(peerID, topic))
 
-		require.Empty(t, forks.observedDigests)
-		require.Equal(t, "c6ecb76c", forks.ActiveDigest())
 		require.Equal(t, []string{topic}, tr.GetDiscoveredTopics())
 		require.Empty(t, topicDiscovered)
 	})
@@ -184,7 +157,6 @@ func TestPeerTopicTracerTracksForkDigestFromMessages(t *testing.T) {
 		})
 
 		require.Equal(t, []string{subscriptionTopic}, tr.GetDiscoveredTopics())
-		require.Equal(t, []string{"c6ecb76c"}, mockFrkMgr.observedDigests)
 
 		tr.Trace(&pubsubpb.TraceEvent{
 			Type: pubsubpb.TraceEvent_SEND_RPC.Enum(),
@@ -276,18 +248,6 @@ func subscriptionEvent(peerID peer.ID, topic string, subscribe bool) *pubsubpb.T
 					Subscribe: new(subscribe),
 					Topic:     new(topic),
 				}},
-			},
-		},
-	}
-}
-
-func messageEvent(peerID peer.ID, topic string) *pubsubpb.TraceEvent {
-	return &pubsubpb.TraceEvent{
-		Type: pubsubpb.TraceEvent_RECV_RPC.Enum(),
-		RecvRPC: &pubsubpb.TraceEvent_RecvRPC{
-			ReceivedFrom: []byte(peerID),
-			Meta: &pubsubpb.TraceEvent_RPCMeta{
-				Messages: []*pubsubpb.TraceEvent_MessageMeta{{Topic: new(topic)}},
 			},
 		},
 	}

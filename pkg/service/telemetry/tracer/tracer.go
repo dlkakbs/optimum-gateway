@@ -72,7 +72,6 @@ func (t *PeerTopicTracer) Trace(evt *pubsubpb.TraceEvent) {
 			if m == nil || m.Topic == nil {
 				continue
 			}
-			t.observeForkDigest(*m.Topic)
 			telemetry.LibP2PGossipsubRPCMessagesInc(*m.Topic, peerID.String(), "recv")
 		}
 
@@ -138,16 +137,6 @@ func (t *PeerTopicTracer) notifyTopicDiscovered() {
 	select {
 	case t.topicDiscovered <- struct{}{}:
 	default:
-	}
-}
-
-func (t *PeerTopicTracer) observeForkDigest(topic string) {
-	forkDigest := topics.GetForkDigestFromTopic(topic)
-	if forkDigest == "" || forkDigest == t.forkManager.ActiveDigest() {
-		return
-	}
-	if t.forkManager.CheckForkSupported(forkDigest) {
-		t.forkManager.SetObservedDigest(forkDigest)
 	}
 }
 
