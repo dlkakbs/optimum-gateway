@@ -127,8 +127,8 @@ func (s *Service) handleSubscription(ctx context.Context, topicName string, sub 
 			if msg.ReceivedFrom == s.hostLibP2P.ID() {
 				continue
 			}
-			if forkDigest := topics.GetForkDigestFromTopic(topicName); forkDigest != "" {
-				if s.srvForkMgr.ObserveMessageDigest(forkDigest) {
+			if forkDigest := topics.GetForkDigestFromTopic(topicName); s.srvForkMgr.CanObserveMessageDigest(forkDigest) {
+				if s.validForkActivationMessage(topicName, msg.Data) && s.srvForkMgr.ObserveMessageDigest(forkDigest) {
 					s.log.Info("active fork digest updated from CL traffic",
 						logger.WithString("fork_digest", forkDigest),
 						logger.WithTopic(topicName),
@@ -148,6 +148,22 @@ func (s *Service) handleSubscription(ctx context.Context, topicName string, sub 
 				return
 			}
 		}
+	}
+}
+
+// validForkActivationMessage checks the gossip envelope before it is allowed to
+// advance gateway-wide fork state. Full forwarding policy remains downstream.
+func (s *Service) validForkActivationMessage(topicName string, payload []byte) bool {
+	meta := topics.TopicMetaFor(topicName)
+	switch {
+	case meta.IsBeaconBlock():
+		_, err := consensus.DecodeBeaconBlockHeader(payload)
+		return err == nil
+	case meta.IsAttestation():
+		var attestation consensus.SingleAttestation
+		return s.sszEncoder.DecodeGossip(payload, &attestation) == nil
+	default:
+		return false
 	}
 }
 

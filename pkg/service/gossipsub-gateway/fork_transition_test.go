@@ -33,7 +33,27 @@ type forkTransitionCL struct {
 	received map[string][][]byte
 }
 
-func startForkTransitionGatewayHost(t *testing.T, svc *Service) {
+type forkTransitionEventTracer struct {
+	peerTopics *tracer.PeerTopicTracer
+	grafted    chan string
+}
+
+func (f *forkTransitionEventTracer) Trace(event *pubsubpb.TraceEvent) {
+	f.peerTopics.Trace(event)
+	if event == nil || event.GetType() != pubsubpb.TraceEvent_GRAFT {
+		return
+	}
+	graft := event.GetGraft()
+	if graft == nil || graft.GetTopic() == "" {
+		return
+	}
+	select {
+	case f.grafted <- graft.GetTopic():
+	default:
+	}
+}
+
+func startForkTransitionGatewayHost(t *testing.T, svc *Service) *forkTransitionEventTracer {
 	t.Helper()
 	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
 	require.NoError(t, err)
@@ -41,6 +61,10 @@ func startForkTransitionGatewayHost(t *testing.T, svc *Service) {
 
 	svc.hostLibP2P = h
 	svc.peerTopicTracer = tracer.NewPeerTopicTracer(svc.log, svc.GetForkDigestManager(), svc.topicDiscovered)
+	eventTracer := &forkTransitionEventTracer{
+		peerTopics: svc.peerTopicTracer,
+		grafted:    make(chan string, 128),
+	}
 	svc.ps, err = libp2ppubsub.NewGossipSub(svc.ctx, h,
 		libp2ppubsub.WithMessageSignaturePolicy(libp2ppubsub.StrictNoSign),
 		libp2ppubsub.WithNoAuthor(),
@@ -49,9 +73,10 @@ func startForkTransitionGatewayHost(t *testing.T, svc *Service) {
 		libp2ppubsub.WithGossipSubParams(pubsubGossipParam()),
 		libp2ppubsub.WithPeerExchange(false),
 		libp2ppubsub.WithMaxMessageSize(consensus.MaxCompressedGossipSize()),
-		libp2ppubsub.WithEventTracer(svc.peerTopicTracer),
+		libp2ppubsub.WithEventTracer(eventTracer),
 	)
 	require.NoError(t, err)
+	return eventTracer
 }
 
 func startForkTransitionCL(t *testing.T, svc *Service) *forkTransitionCL {
@@ -183,6 +208,18 @@ func requireNoForkTransitionPayload(t *testing.T, cl *forkTransitionCL, topic st
 	}, 2*gossipSubHeartbeatInterval, 50*time.Millisecond)
 }
 
+func requireForkTransitionMesh(t *testing.T, eventTracer *forkTransitionEventTracer, topic string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		select {
+		case graftedTopic := <-eventTracer.grafted:
+			return graftedTopic == topic
+		default:
+			return false
+		}
+	}, 10*time.Second, 50*time.Millisecond)
+}
+
 // TestForkTransitionAggregatedAttestations extends the #186 reproduction shared
 // by its reporter across both sides of the fork transition.
 func TestForkTransitionAggregatedAttestations(t *testing.T) {
@@ -193,7 +230,7 @@ func TestForkTransitionAggregatedAttestations(t *testing.T) {
 	require.True(t, forkManager.CheckForkSupported(forkTestCurrentDigest))
 	require.True(t, forkManager.CheckForkSupported(forkTestFutureDigest))
 
-	startForkTransitionGatewayHost(t, svc)
+	eventTracer := startForkTransitionGatewayHost(t, svc)
 	svc.subscribeOnce()
 	cl := startForkTransitionCL(t, svc)
 
@@ -205,8 +242,7 @@ func TestForkTransitionAggregatedAttestations(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return len(svc.ps.ListPeers(currentTopic)) == 1 && len(cl.ps.ListPeers(currentTopic)) == 1
 	}, 10*time.Second, 50*time.Millisecond)
-	// Allow both gossip meshes two configured heartbeats to settle.
-	time.Sleep(2 * gossipSubHeartbeatInterval)
+	requireForkTransitionMesh(t, eventTracer, currentTopic)
 
 	baseline := deliverForkTransitionAttestation(t, svc, 1)
 	require.Eventually(t, func() bool {
@@ -235,6 +271,12 @@ func TestForkTransitionAggregatedAttestations(t *testing.T) {
 		return cl.countPayload(currentTopic, stillPreFork) == 1
 	}, 10*time.Second, 50*time.Millisecond)
 	requireNoForkTransitionPayload(t, cl, futureTopic, stillPreFork)
+	require.Equal(t, forkTestCurrentDigest, forkManager.ActiveDigest())
+
+	// Malformed traffic cannot advance gateway-wide fork state.
+	malformedFuture := []byte("not-valid-ssz-snappy")
+	cl.publish(t, futureTopic, malformedFuture)
+	requireForkTransitionCLMessage(t, svc, futureTopic, malformedFuture)
 	require.Equal(t, forkTestCurrentDigest, forkManager.ActiveDigest())
 
 	// Actual CL traffic on the configured future topic activates the new digest.

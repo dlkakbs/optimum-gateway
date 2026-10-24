@@ -89,15 +89,20 @@ func (s *Service) CheckForkSupported(digest string) bool {
 	return ok
 }
 
+// CanObserveMessageDigest reports whether a message on digest could advance the
+// active fork. Callers can use it to avoid validating ordinary gossip twice.
+func (s *Service) CanObserveMessageDigest(digest string) bool {
+	digest = sanitizeForkDigest(digest)
+	future, _ := s.cfgFutureDigest.Load().(string)
+	return digest != "" && future != "" && digest == future &&
+		s.CheckForkSupported(digest) && digest != s.ActiveDigest()
+}
+
 // ObserveMessageDigest promotes the active digest only to the configured future
 // fork. Messages on the previous fork cannot roll an observed transition back.
 func (s *Service) ObserveMessageDigest(digest string) bool {
 	digest = sanitizeForkDigest(digest)
-	future, _ := s.cfgFutureDigest.Load().(string)
-	if digest == "" || future == "" || digest != future || !s.CheckForkSupported(digest) {
-		return false
-	}
-	if digest == s.ActiveDigest() {
+	if !s.CanObserveMessageDigest(digest) {
 		return false
 	}
 	s.observedDigestLC.Store(digest)
