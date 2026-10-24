@@ -151,20 +151,15 @@ func (s *Service) handleSubscription(ctx context.Context, topicName string, sub 
 	}
 }
 
-// validForkActivationMessage checks the gossip envelope before it is allowed to
-// advance gateway-wide fork state. Full forwarding policy remains downstream.
+// validForkActivationMessage accepts only attestations as fork signals. Blocks
+// keep their source topic when forwarded, while their SSZ schema is fork-specific.
 func (s *Service) validForkActivationMessage(topicName string, payload []byte) bool {
 	meta := topics.TopicMetaFor(topicName)
-	switch {
-	case meta.IsBeaconBlock():
-		_, err := consensus.DecodeBeaconBlockHeader(payload)
-		return err == nil
-	case meta.IsAttestation():
-		var attestation consensus.SingleAttestation
-		return s.sszEncoder.DecodeGossip(payload, &attestation) == nil
-	default:
+	if !meta.IsAttestation() {
 		return false
 	}
+	var attestation consensus.SingleAttestation
+	return s.sszEncoder.DecodeGossip(payload, &attestation) == nil
 }
 
 // unsubscribeFromTopic unconditionally removes the current subscription for topic.

@@ -2,10 +2,13 @@ package gossipsub_gateway
 
 import (
 	"bytes"
+	"encoding/hex"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/golang/snappy"
 	"github.com/libp2p/go-libp2p"
 	libp2ppubsub "github.com/libp2p/go-libp2p-pubsub"
 	pubsubpb "github.com/libp2p/go-libp2p-pubsub/pb"
@@ -178,6 +181,23 @@ func forkTransitionAttestation(t *testing.T, attester uint64) ([]byte, []byte) {
 	return packed[0], encoded
 }
 
+func truncatedForkTransitionBlock(t *testing.T) []byte {
+	t.Helper()
+	encoded, err := hex.DecodeString(strings.TrimSpace(test_utils.ValidBeaconBlockMessage))
+	require.NoError(t, err)
+	raw, err := (&consensus.SSZSnappyCodec{}).DecodeGossipRaw(encoded)
+	require.NoError(t, err)
+
+	// SignedBeaconBlock prefix (4-byte offset + 96-byte signature) and the
+	// 112-byte header are enough for DecodeBeaconBlockHeader, but omit the body.
+	const headerOnlyLen = 4 + 96 + 112
+	require.GreaterOrEqual(t, len(raw), headerOnlyLen)
+	truncated := snappy.Encode(nil, raw[:headerOnlyLen])
+	_, err = consensus.DecodeBeaconBlockHeader(truncated)
+	require.NoError(t, err)
+	return truncated
+}
+
 func deliverForkTransitionAttestation(t *testing.T, svc *Service, attester uint64) []byte {
 	t.Helper()
 	packed, encoded := forkTransitionAttestation(t, attester)
@@ -236,6 +256,7 @@ func TestForkTransitionAggregatedAttestations(t *testing.T) {
 
 	currentTopic := topics.BuildFullTopic(forkTestCurrentDigest, "beacon_attestation_5")
 	futureTopic := topics.BuildFullTopic(forkTestFutureDigest, "beacon_attestation_5")
+	futureBlockTopic := topics.BuildFullTopic(forkTestFutureDigest, "beacon_block")
 	cl.subscribe(t, currentTopic)
 	go svc.handleMessagesFromMumP2PNode()
 
@@ -252,10 +273,15 @@ func TestForkTransitionAggregatedAttestations(t *testing.T) {
 
 	// A pre-fork subscription prepares the future topic without activating it.
 	cl.subscribe(t, futureTopic)
+	cl.subscribe(t, futureBlockTopic)
 	require.Eventually(t, func() bool {
-		_, joined := svc.libP2PTopics.Load(futureTopic)
-		return joined && len(svc.ps.ListPeers(futureTopic)) == 1 && len(cl.ps.ListPeers(futureTopic)) == 1
+		_, joinedAttestation := svc.libP2PTopics.Load(futureTopic)
+		_, joinedBlock := svc.libP2PTopics.Load(futureBlockTopic)
+		return joinedAttestation && joinedBlock &&
+			len(svc.ps.ListPeers(futureTopic)) == 1 && len(cl.ps.ListPeers(futureTopic)) == 1 &&
+			len(svc.ps.ListPeers(futureBlockTopic)) == 1 && len(cl.ps.ListPeers(futureBlockTopic)) == 1
 	}, 10*time.Second, 50*time.Millisecond)
+	requireForkTransitionMesh(t, eventTracer, futureBlockTopic)
 	require.Equal(t, forkTestCurrentDigest, forkManager.ActiveDigest())
 
 	preFork := deliverForkTransitionAttestation(t, svc, 2)
@@ -271,6 +297,13 @@ func TestForkTransitionAggregatedAttestations(t *testing.T) {
 		return cl.countPayload(currentTopic, stillPreFork) == 1
 	}, 10*time.Second, 50*time.Millisecond)
 	requireNoForkTransitionPayload(t, cl, futureTopic, stillPreFork)
+	require.Equal(t, forkTestCurrentDigest, forkManager.ActiveDigest())
+
+	// A header-only future block cannot activate the fork. Blocks retain their
+	// source topic, so attestation traffic is the activation signal.
+	truncatedFutureBlock := truncatedForkTransitionBlock(t)
+	cl.publish(t, futureBlockTopic, truncatedFutureBlock)
+	requireForkTransitionCLMessage(t, svc, futureBlockTopic, truncatedFutureBlock)
 	require.Equal(t, forkTestCurrentDigest, forkManager.ActiveDigest())
 
 	// Malformed traffic cannot advance gateway-wide fork state.
